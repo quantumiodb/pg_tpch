@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
-#include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -130,44 +129,56 @@ TPCHTableGenerator::~TPCHTableGenerator() {
 
 class TableLoader {
  public:
-  TableLoader(const std::string& table) : table_{std::move(table)} {
+  static const int BATCH_SIZE = 1000;
+
+  TableLoader(const std::string& table) : table_{table} {
     reloid_ = DirectFunctionCall1(regclassin, CStringGetDatum(table_.c_str()));
-    rel_ = try_table_open(reloid_, NoLock);
+    rel_ = try_table_open(reloid_, AccessShareLock, false);
     if (!rel_)
       throw std::runtime_error("try_table_open Failed");
 
     auto tupDesc = RelationGetDescr(rel_);
+    natts_ = tupDesc->natts;
     Oid in_func_oid;
 
-    in_functions = new FmgrInfo[tupDesc->natts];
-    typioparams = new Oid[tupDesc->natts];
+    in_functions = new FmgrInfo[natts_];
+    typioparams = new Oid[natts_];
+    out_func_oids_ = new Oid[natts_];
+    typisvarlena_ = new bool[natts_];
 
-    for (auto attnum = 1; attnum <= tupDesc->natts; attnum++) {
+    for (int attnum = 1; attnum <= natts_; attnum++) {
       Form_pg_attribute att = TupleDescAttr(tupDesc, attnum - 1);
 
       getTypeInputInfo(att->atttypid, &in_func_oid, &typioparams[attnum - 1]);
       fmgr_info(in_func_oid, &in_functions[attnum - 1]);
+      getTypeOutputInfo(att->atttypid, &out_func_oids_[attnum - 1], &typisvarlena_[attnum - 1]);
     }
 
     slot = MakeSingleTupleTableSlot(tupDesc, &TTSOpsMinimalTuple);
     slot->tts_tableOid = RelationGetRelid(rel_);
+
+    initStringInfo(&batch_buf_);
+    batch_count_ = 0;
   };
 
   ~TableLoader() {
-    table_close(rel_, NoLock);
-    free(in_functions);
-    free(typioparams);
+    flush();
+    table_close(rel_, AccessShareLock);
+    delete[] in_functions;
+    delete[] typioparams;
+    delete[] out_func_oids_;
+    delete[] typisvarlena_;
     ExecDropSingleTupleTableSlot(slot);
+    pfree(batch_buf_.data);
   }
 
   template <typename T>
   auto& addItem(T value) {
-    Datum datum;
     if constexpr (std::is_same_v<T, char*> || std::is_same_v<T, const char*> || std::is_same_v<T, char>)
       slot->tts_values[current_item_] = DirectFunctionCall3(
           in_functions[current_item_].fn_addr, CStringGetDatum(value), ObjectIdGetDatum(typioparams[current_item_]),
           TupleDescAttr(RelationGetDescr(rel_), current_item_)->atttypmod);
-    else  // else check
+    else
       slot->tts_values[current_item_] = value;
 
     current_item_++;
@@ -176,9 +187,9 @@ class TableLoader {
 
   auto& start() {
     ExecClearTuple(slot);
-    MemSet(slot->tts_values, 0, RelationGetDescr(rel_)->natts * sizeof(Datum));
+    MemSet(slot->tts_values, 0, natts_ * sizeof(Datum));
     /* all tpch table is not null */
-    MemSet(slot->tts_isnull, false, RelationGetDescr(rel_)->natts * sizeof(bool));
+    MemSet(slot->tts_isnull, false, natts_ * sizeof(bool));
     current_item_ = 0;
     return *this;
   }
@@ -186,13 +197,55 @@ class TableLoader {
   auto& end() {
     ExecStoreVirtualTuple(slot);
 
-    table_tuple_insert(rel_, slot, mycid, ti_options, NULL);
-    // reindex ？
-    // if (rel_->ri_NumIndices > 0)
-    //   recheckIndexes = ExecInsertIndexTuples(rel_, myslot, estate, false, false, NULL, NIL, false);
+    if (batch_count_ > 0)
+      appendStringInfoChar(&batch_buf_, ',');
+    appendStringInfoChar(&batch_buf_, '(');
 
+    for (int i = 0; i < natts_; i++) {
+      if (i > 0)
+        appendStringInfoChar(&batch_buf_, ',');
+      if (slot->tts_isnull[i]) {
+        appendStringInfoString(&batch_buf_, "NULL");
+      } else {
+        char* outstr = OidOutputFunctionCall(out_func_oids_[i], slot->tts_values[i]);
+        appendStringInfoChar(&batch_buf_, '\'');
+        for (char* p = outstr; *p; p++) {
+          if (*p == '\'')
+            appendStringInfoChar(&batch_buf_, '\'');
+          appendStringInfoChar(&batch_buf_, *p);
+        }
+        appendStringInfoChar(&batch_buf_, '\'');
+        pfree(outstr);
+      }
+    }
+    appendStringInfoChar(&batch_buf_, ')');
+    batch_count_++;
     row_count_++;
+
+    if (batch_count_ >= BATCH_SIZE)
+      flush();
+
     return *this;
+  }
+
+  void flush() {
+    if (batch_count_ == 0)
+      return;
+
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "INSERT INTO %s VALUES %s", table_.c_str(), batch_buf_.data);
+
+    SPI_connect();
+    int ret = SPI_exec(sql.data, 0);
+    SPI_finish();
+
+    if (ret < 0)
+      elog(ERROR, "pg_tpch: SPI INSERT failed for table %s: %d", table_.c_str(), ret);
+
+    pfree(sql.data);
+    resetStringInfo(&batch_buf_);
+    batch_count_ = 0;
   }
 
   auto row_count() const { return row_count_; }
@@ -202,24 +255,31 @@ class TableLoader {
   std::string table_;
   size_t row_count_ = 0;
   size_t current_item_ = 0;
+  int natts_ = 0;
 
   FmgrInfo* in_functions;
   Oid* typioparams;
+  Oid* out_func_oids_;
+  bool* typisvarlena_;
   TupleTableSlot* slot;
-  CommandId mycid = GetCurrentCommandId(true);
-  int ti_options = (TABLE_INSERT_SKIP_FSM | TABLE_INSERT_FROZEN | TABLE_INSERT_NO_LOGICAL);
+
+  StringInfoData batch_buf_;
+  int batch_count_ = 0;
 };
 
 std::string convert_money_str(DSS_HUGE cents) {
+  char buf[32];
   if (cents < 0) {
     cents = std::abs(cents);
-    return std::format("-{}.{:02d}", cents / 100, cents % 100);
-  } else
-    return std::format("{}.{:02d}", cents / 100, cents % 100);
+    snprintf(buf, sizeof(buf), "-%lld.%02lld", (long long)(cents / 100), (long long)(cents % 100));
+  } else {
+    snprintf(buf, sizeof(buf), "%lld.%02lld", (long long)(cents / 100), (long long)(cents % 100));
+  }
+  return buf;
 }
 
-std::string convert_str(auto date) {
-  return std::format("{}", date);
+std::string convert_str(char c) {
+  return std::string(1, c);
 }
 
 std::pair<int, int> TPCHTableGenerator::generate_customer() {

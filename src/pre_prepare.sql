@@ -36,3 +36,4 @@ INSERT INTO tpch.tpch_tables(table_name, status, child, weight) VALUES ('part', 
 
 CREATE TABLE tpch.tpch_host_info(host_core INT);
 INSERT INTO tpch.tpch_host_info(host_core) VALUES (16);
+update tpch.tpch_host_info set host_core = 20;

@@ -11,18 +11,12 @@ CREATE FUNCTION dbgen_internal(
 CREATE FUNCTION tpch_prepare() RETURNS BOOLEAN AS 'MODULE_PATHNAME',
 'tpch_prepare' LANGUAGE C IMMUTABLE STRICT;
 
-CREATE FUNCTION tpch_async_submit(IN SQL TEXT, OUT cid INT) RETURNS INT AS 'MODULE_PATHNAME',
-'tpch_async_submit' LANGUAGE C IMMUTABLE STRICT;
-
-CREATE FUNCTION tpch_async_consum(IN conn INT, OUT t1_count INT, OUT t2_count INT) RETURNS record AS 'MODULE_PATHNAME',
-'tpch_async_consum' LANGUAGE C IMMUTABLE STRICT;
-
 CREATE FUNCTION tpch_cleanup(clean_stats BOOLEAN DEFAULT FALSE) RETURNS BOOLEAN AS $$
 DECLARE
     tbl TEXT;
 BEGIN
-    FOR tbl IN 
-        SELECT table_name 
+    FOR tbl IN
+        SELECT table_name
         FROM tpch.tpch_tables
     LOOP
         EXECUTE 'truncate ' || tbl;
@@ -42,51 +36,46 @@ CREATE FUNCTION dbgen(
 ) RETURNS TABLE(tab TEXT, row_count INT) AS $$
 DECLARE
     rec RECORD;
-    row_count_rec RECORD;
-    cleanup_needed BOOLEAN;
-    host_core_count INT;
-    total_table_weight INT;
-    num_children INT;
-    query_text TEXT;
+    num_segs INT;
+    t1_total INT;
+    t2_total INT;
+    step INT;
 BEGIN
-    -- cleanup_needed := tpch_cleanup(should_overwrite);
+    SELECT count(*) INTO num_segs
+    FROM gp_segment_configuration
+    WHERE role = 'p' AND content >= 0;
 
-    CREATE TEMP TABLE temp_cid_table(cid INT, c_name TEXT, c_status INT, c_child TEXT);
     CREATE TEMP TABLE temp_count_table(c_name TEXT, c_count INT);
 
-    SELECT host_core INTO host_core_count FROM tpch.tpch_host_info;
-
-    SELECT SUM(weight) INTO total_table_weight FROM tpch.tpch_tables;
-
-    FOR rec IN SELECT table_name, status, child, weight FROM tpch.tpch_tables LOOP
-        -- children table
-        IF rec.status = 2 THEN
-            CONTINUE;
-        END IF;
-        num_children := CEIL(rec.weight::NUMERIC / total_table_weight * host_core_count);
-        FOR i IN 0..num_children - 1 LOOP
-            query_text := format('SELECT * FROM dbgen_internal(%s, %L, %s, %s)', scale_factor, rec.table_name, num_children, i);
-            -- raise notice '%', query_text;
-            INSERT INTO temp_cid_table SELECT cid, rec.table_name, rec.status, rec.child FROM tpch_async_submit(query_text);
+    FOR rec IN SELECT table_name, status, child FROM tpch.tpch_tables WHERE status != 2 LOOP
+        t1_total := 0;
+        t2_total := 0;
+        FOR step IN 0..num_segs-1 LOOP
+            DECLARE
+                r1 INT; r2 INT;
+            BEGIN
+                SELECT t1_count, t2_count INTO r1, r2
+                FROM dbgen_internal(scale_factor, rec.table_name, num_segs, step);
+                t1_total := t1_total + coalesce(r1, 0);
+                t2_total := t2_total + coalesce(r2, 0);
+            END;
         END LOOP;
-    END LOOP;
 
-    FOR rec IN SELECT cid, c_name, c_status, c_child FROM temp_cid_table LOOP
-        SELECT t1_count, t2_count INTO row_count_rec FROM tpch_async_consum(rec.cid);
-        INSERT INTO temp_count_table VALUES(rec.c_name, row_count_rec.t1_count);
+        INSERT INTO temp_count_table VALUES(rec.table_name, t1_total);
 
-        IF rec.c_status = 1 THEN
-            INSERT INTO temp_count_table VALUES(rec.c_child, row_count_rec.t2_count);
+        IF rec.status = 1 THEN
+            INSERT INTO temp_count_table VALUES(rec.child, t2_total);
         END IF;
     END LOOP;
-    FOR rec IN SELECT c_name, sum(c_count) as count FROM temp_count_table GROUP BY c_name order by 2 LOOP
+
+    FOR rec IN SELECT c_name, sum(c_count) AS count FROM temp_count_table GROUP BY c_name ORDER BY 2 LOOP
         tab := rec.c_name;
         row_count := rec.count;
         EXECUTE 'REINDEX TABLE ' || rec.c_name;
         EXECUTE 'ANALYZE ' || rec.c_name;
         RETURN NEXT;
     END LOOP;
-    DROP TABLE temp_cid_table;
+
     DROP TABLE temp_count_table;
 END;
 $$ LANGUAGE plpgsql;
@@ -134,7 +123,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION tpch(VARIADIC queries INT [] DEFAULT '{0}'::INT []) RETURNS TABLE (
-  "Qid" CHAR(2),
+  "Qid" CHAR(4),
   "Stable(ms)" TEXT,
   "Current(ms)" TEXT,
   "Diff(%)" TEXT,
