@@ -7,10 +7,9 @@
 namespace tpch {
 
 struct tpch_runner_result {
-  bool is_new;
   int qid;
   double duration;
-  double checked;
+  bool checked;
 };
 
 struct TPCHWrapper {
@@ -22,6 +21,8 @@ struct TPCHWrapper {
   static void CreateTPCHSchema();
 
   static tpch_runner_result* RunTPCH(int qid);
+
+  static int CollectAnswers();
 };
 
 }  // namespace tpch

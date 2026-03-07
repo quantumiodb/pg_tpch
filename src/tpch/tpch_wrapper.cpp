@@ -46,6 +46,35 @@ class Executor {
     if (auto ret = SPI_exec(query.c_str(), 0); ret < 0)
       throw std::runtime_error("SPI_exec Failed, get " + std::to_string(ret));
   }
+
+  std::vector<std::string> execute_and_capture(const std::string &query) const {
+    if (auto ret = SPI_exec(query.c_str(), 0); ret < 0)
+      throw std::runtime_error("SPI_exec Failed, get " + std::to_string(ret));
+
+    std::vector<std::string> rows;
+    if (SPI_tuptable && SPI_processed > 0) {
+      SPITupleTable *tuptable = SPI_tuptable;
+      TupleDesc tupdesc = tuptable->tupdesc;
+      int natts = tupdesc->natts;
+
+      rows.reserve(SPI_processed);
+      for (uint64 i = 0; i < SPI_processed; i++) {
+        HeapTuple tuple = tuptable->vals[i];
+        std::string row;
+        for (int col = 1; col <= natts; col++) {
+          if (col > 1) row += '|';
+          char *val = SPI_getvalue(tuple, tupdesc, col);
+          if (val) {
+            row += val;
+            pfree(val);
+          }
+        }
+        rows.push_back(std::move(row));
+      }
+      std::sort(rows.begin(), rows.end());
+    }
+    return rows;
+  }
 };
 
 [[maybe_unused]] static double exec_spec(const auto &path, const Executor &executor) {
@@ -58,6 +87,39 @@ class Executor {
     return std::chrono::duration<double, std::milli>(end - start).count();
   }
   return 0;
+}
+
+struct exec_result {
+  double duration;
+  std::vector<std::string> rows;
+};
+
+[[maybe_unused]] static exec_result exec_spec_capture(const auto &path, const Executor &executor) {
+  if (std::filesystem::exists(path)) {
+    std::ifstream file(path);
+    std::string sql((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const auto start = std::chrono::high_resolution_clock::now();
+    auto rows = executor.execute_and_capture(sql);
+    const auto end = std::chrono::high_resolution_clock::now();
+    double dur = std::chrono::duration<double, std::milli>(end - start).count();
+    return {dur, std::move(rows)};
+  }
+  return {0.0, {}};
+}
+
+static std::vector<std::string> load_answer_file(const std::filesystem::path &path) {
+  std::vector<std::string> lines;
+  if (!std::filesystem::exists(path))
+    return lines;
+
+  std::ifstream file(path);
+  std::string line;
+  while (std::getline(file, line)) {
+    if (!line.empty())
+      lines.push_back(std::move(line));
+  }
+  std::sort(lines.begin(), lines.end());
+  return lines;
 }
 
 void TPCHWrapper::CreateTPCHSchema() {
@@ -118,18 +180,80 @@ tpch_runner_result *TPCHWrapper::RunTPCH(int qid) {
   // Run query inside its own scope so Executor destructor (SPI_finish) fires
   // before palloc — palloc must happen in the outer (caller's) memory context,
   // not the SPI context that SPI_finish would free.
-  double duration;
+  tpch_runner_result tmp;
+  tmp.qid = qid;
+  std::vector<std::string> actual_rows;
   {
     Executor executor;
-    duration = exec_spec(queries, executor);
+    auto er = exec_spec_capture(queries, executor);
+    tmp.duration = er.duration;
+    actual_rows = std::move(er.rows);
+  }
+
+  // Validate against answer file
+  char aname[16];
+  snprintf(aname, sizeof(aname), "%02d.ans", qid);
+  auto answer_path = std::filesystem::path(TPCH_ANSWERS_DIR) / aname;
+
+  if (!std::filesystem::exists(answer_path)) {
+    tmp.checked = false;
+  } else {
+    auto expected_rows = load_answer_file(answer_path);
+    tmp.checked = (actual_rows == expected_rows);
   }
 
   auto *result = (tpch_runner_result *)palloc(sizeof(tpch_runner_result));
-  result->qid = qid;
-  result->duration = duration;
-  result->checked = true;
-
+  *result = tmp;
   return result;
+}
+
+int TPCHWrapper::CollectAnswers() {
+  const std::filesystem::path extension_dir = get_extension_external_directory();
+  auto ans_dir = std::filesystem::path(TPCH_ANSWERS_DIR);
+
+  // Skip if answer files already exist
+  if (std::filesystem::exists(ans_dir)) {
+    int existing = 0;
+    for (auto &e : std::filesystem::directory_iterator(ans_dir)) {
+      if (e.path().extension() == ".ans") existing++;
+    }
+    if (existing >= (int)TPCH_QUERIES_COUNT)
+      return 0;
+  }
+
+  std::filesystem::create_directories(ans_dir);
+
+  Executor executor;
+
+  // Use planner (optimizer=off) for deterministic baseline results
+  executor.execute("SET optimizer = off");
+
+  int count = 0;
+  for (int qid = 1; qid <= (int)TPCH_QUERIES_COUNT; qid++) {
+    char qname[16];
+    snprintf(qname, sizeof(qname), "%02d.sql", qid);
+    auto qpath = extension_dir / "queries" / qname;
+    if (!std::filesystem::exists(qpath)) continue;
+
+    char aname[16];
+    snprintf(aname, sizeof(aname), "%02d.ans", qid);
+    auto apath = ans_dir / aname;
+
+    if (std::filesystem::exists(apath)) { count++; continue; }
+
+    std::ifstream qfile(qpath);
+    std::string sql((std::istreambuf_iterator<char>(qfile)), std::istreambuf_iterator<char>());
+    auto rows = executor.execute_and_capture(sql);
+
+    std::ofstream out(apath);
+    for (const auto &row : rows)
+      out << row << '\n';
+    out.close();
+    count++;
+  }
+
+  executor.execute("RESET optimizer");
+  return count;
 }
 
 std::pair<int, int> TPCHWrapper::DBGen(double scale, char *table, int children, int step) {

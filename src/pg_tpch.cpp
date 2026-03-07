@@ -65,6 +65,15 @@ static tpch_runner_result* tpch_runner(int qid) {
   }
 }
 
+static int tpch_collect_answers_internal() {
+  try {
+    return tpch::TPCHWrapper::CollectAnswers();
+  } catch (const std::exception& e) {
+    elog(ERROR, "TPC-H Failed to collect answers, get error: %s", e.what());
+  }
+  return -1;
+}
+
 }  // namespace tpch
 
 extern "C" {
@@ -132,11 +141,18 @@ Datum tpch_runner(PG_FUNCTION_ARGS) {
 
   tpch::tpch_runner_result* result = tpch::tpch_runner(qid);
 
-  values[0] = result->qid;
+  values[0] = Int32GetDatum(result->qid);
   values[1] = Float8GetDatum(result->duration);
   values[2] = BoolGetDatum(result->checked);
 
   PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+PG_FUNCTION_INFO_V1(tpch_collect_answers);
+
+Datum tpch_collect_answers(PG_FUNCTION_ARGS) {
+  int count = tpch::tpch_collect_answers_internal();
+  PG_RETURN_INT32(count);
 }
 
 PG_FUNCTION_INFO_V1(dbgen_internal);

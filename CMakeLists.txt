@@ -57,6 +57,11 @@ add_postgresql_extension(
   SCRIPTS src/pg_tpch--1.0.sql
 )
 
+if(NOT DEFINED TPCH_ANSWERS_DIR)
+  set(TPCH_ANSWERS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/answers)
+endif()
+target_compile_definitions(tpch PRIVATE TPCH_ANSWERS_DIR="${TPCH_ANSWERS_DIR}")
+
 target_link_libraries(pg_tpch tpch pq)
 
 cmake_host_system_information(RESULT core_num QUERY NUMBER_OF_LOGICAL_CORES)
